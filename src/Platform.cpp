@@ -120,7 +120,7 @@ struct HttpHandle {
 };
 
 void CheckStop(std::stop_token stop) {
-    if (stop.stop_requested()) throw std::runtime_error("Operation cancelled");
+    if (stop.stop_requested()) throw OperationCancelled();
 }
 
 bool HasControl(std::wstring_view text) {
@@ -129,7 +129,8 @@ bool HasControl(std::wstring_view text) {
 
 bool ValidRegionCode(std::string_view code) {
     if (code == "GLOBAL") return true;
-    return !code.empty() && code.size() <= 64 && std::all_of(code.begin(), code.end(), [](char c) {
+    return !code.empty() && code.size() <= 64 && code.front() != '-' && code.back() != '-'
+        && std::all_of(code.begin(), code.end(), [](char c) {
         return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
     });
 }
@@ -351,8 +352,8 @@ void RequireWritableFirewall(INetFwPolicy2* policy, bool applying) {
     if (!services.empty()) throw std::runtime_error(WideToUtf8(services) + "Enable/start Windows Firewall services in Windows before retrying.");
     NET_FW_MODIFY_STATE state{};
     CheckHr(policy->get_LocalPolicyModifyState(&state), "Read firewall policy modification state");
-    if (state != NET_FW_MODIFY_STATE_OK) {
-        throw std::runtime_error("Windows policy does not allow local firewall changes (Group Policy or inbound blocking policy).");
+    if (state != NET_FW_MODIFY_STATE_OK && state != NET_FW_MODIFY_STATE_INBOUND_BLOCKED) {
+        throw std::runtime_error("Windows policy does not allow local outbound firewall changes (Group Policy or unknown policy state).");
     }
     if (applying && !ActiveFirewallEnabled(policy)) {
         throw std::runtime_error("Windows Firewall is disabled on an active network profile. Enable it in Windows before applying region rules.");
@@ -505,7 +506,7 @@ std::string ReadFile(const std::filesystem::path& path, std::size_t limit) {
 
 void WriteFileAtomic(const std::filesystem::path& path, std::string_view bytes) {
     if (bytes.size() > kMaxCatalogBytes) throw std::runtime_error("Output file exceeds size limit");
-    std::filesystem::create_directories(path.parent_path());
+    if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
     auto temporary = path;
     temporary += L"." + NewGeneration() + L".tmp";
     FileHandle file(CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
@@ -723,7 +724,8 @@ FirewallState QueryFirewall() {
     state.detail = ServiceProblem();
     NET_FW_MODIFY_STATE modify{};
     CheckHr(policy->get_LocalPolicyModifyState(&modify), "Read firewall policy modification state");
-    if (modify != NET_FW_MODIFY_STATE_OK) state.detail += L"Local firewall policy changes are restricted. ";
+    if (modify != NET_FW_MODIFY_STATE_OK && modify != NET_FW_MODIFY_STATE_INBOUND_BLOCKED)
+        state.detail += L"Local outbound firewall policy changes are restricted. ";
     if (!state.firewallEnabled) state.detail += L"Firewall is disabled on an active network profile. ";
     if (state.detail.empty()) state.detail = L"Windows Firewall is enabled on all active network profiles.";
     return state;

@@ -6,9 +6,15 @@
 
 #include "Core.hpp"
 #include <filesystem>
+#include <stdexcept>
 #include <stop_token>
 
 namespace regionlock {
+class OperationCancelled final : public std::runtime_error {
+public:
+    OperationCancelled() : std::runtime_error("Operation canceled") {}
+};
+
 struct Paths {
     std::filesystem::path directory;
     std::filesystem::path settingsFile;
@@ -23,6 +29,7 @@ struct FirewallState {
     bool firewallEnabled{};
     std::wstring detail;
     std::size_t legacyRuleCount{};
+    bool verified{true};
 };
 struct ProbeResult {
     std::string code;

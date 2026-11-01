@@ -15,16 +15,20 @@
 #include <objidl.h>
 #include <gdiplus.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 
 #include "Core.hpp"
 #include "Platform.hpp"
+#include "ProcessResources.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -93,6 +97,19 @@ std::uint64_t CpuTime() {
     k.LowPart = kernel.dwLowDateTime; k.HighPart = kernel.dwHighDateTime;
     u.LowPart = user.dwLowDateTime; u.HighPart = user.dwHighDateTime;
     return k.QuadPart + u.QuadPart;
+}
+int ThreadBasePriority() {
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return 0;
+    THREADENTRY32 entry{sizeof(entry)};
+    int priority{};
+    if (Thread32First(snapshot, &entry)) {
+        do {
+            if (entry.th32ThreadID == GetCurrentThreadId()) { priority = entry.tpBasePri; break; }
+        } while (Thread32Next(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    return priority;
 }
 
 struct Result {
@@ -180,9 +197,10 @@ private:
     Settings appliedSettings_;
     Catalog catalog_;
     std::jthread worker_;
+    ProcessResources resources_;
     Job job_{Job::Initial};
     bool busy_{}, exiting_{}, closing_{}, suppressChecks_{}, trayAdded_{}, loaded_{};
-    bool firewallKnown_{}, preferencesReady_{};
+    bool firewallKnown_{}, firewallEnabled_{}, preferencesReady_{}, trayMenuOpen_{};
     std::size_t activeRules_{}, probeCompleted_{}, legacyRules_{};
     std::vector<std::wstring> probeDetails_;
     UINT taskbarCreated_{};
@@ -191,11 +209,23 @@ private:
     bool smokeDark_{true}, smokeEnglish_{true}, smokeMaximizedRestore_{};
     bool smokeBusyDark_{}, smokeBusyReadOnly_{}, smokeReadyEditable_{}, smokeSingleInstance_{};
     bool smokeSecondRestored_{};
+    bool smokeBackground_{}, smokeEco_{}, smokeResourceRestored_{}, smokeExitNormal_{};
+    bool smokeCancellationError_{}, smokeExplicitCancellation_{};
+    bool smokeFirewallStatus_{};
+    DWORD smokeOriginalPriority_{}, smokeTrayPriority_{};
+    ULONG smokeTrayMemoryPriority_{};
+    ULONG smokeOriginalMemoryPriority_{};
+    bool smokeMemoryReadable_{};
+    int smokeOriginalThreadPriority_{}, smokeTrayThreadPriority_{};
+    PROCESS_POWER_THROTTLING_STATE smokeOriginalPower_{};
+    bool smokePowerReadable_{};
+    IO_COUNTERS smokeIoBaseline_{};
+    ULONGLONG smokeHiddenIoBytes_{};
     HANDLE smokeSecondProcess_{};
     ULONGLONG smokeSecondStarted_{};
     int smokeStage_{};
     std::uint64_t smokeCpuBaseline_{}, smokeVisibleCpu_{}, smokeHiddenCpu_{};
-    SIZE_T smokeWorkingSet_{};
+    SIZE_T smokeWorkingSet_{}, smokeTrayWorkingSet_{}, smokePrivateBytes_{};
     bool smokeScreenshot_{};
 
     int S(int value) const { return MulDiv(value, static_cast<int>(dpi_), 96); }
@@ -425,8 +455,12 @@ private:
         if (legacyRules_) text += L"\nLegacy BF6_Region_Lock rules detected. Unlock in the old tool first; those rules can still affect matchmaking.";
         SetWindowTextW(status_, text.c_str());
     }
+    std::wstring FirewallLabel() const {
+        return !firewallKnown_ ? L"State unknown" : !activeRules_ ? L"Unlocked"
+            : !firewallEnabled_ ? L"Firewall off" : L"Lock active";
+    }
     void UpdateBadge() {
-        const std::wstring text = !firewallKnown_ ? L"State unknown" : activeRules_ ? L"Lock active" : L"Unlocked";
+        const auto text = FirewallLabel();
         SetWindowTextW(badge_, text.c_str());
         InvalidateRect(badge_, nullptr, TRUE);
         UpdateTrayTip();
@@ -444,6 +478,7 @@ private:
         ShowWindow(cancel_, busy && (job == Job::Probe || job == Job::Update) ? SW_SHOW : SW_HIDE);
         EnableWindow(cancel_, busy);
         InvalidateRect(apply_, nullptr, TRUE);
+        UpdateResourceMode();
     }
     std::vector<std::string> Selection() const {
         std::vector<std::string> selected;
@@ -512,9 +547,13 @@ private:
             try {
                 function(*result, stop);
                 result->success = true;
+            } catch (const OperationCancelled&) {
+                result->canceled = true;
+                result->message = L"Task canceled.";
             } catch (const std::exception& error) {
-                result->canceled = stop.stop_requested();
-                result->message = result->canceled ? L"Task canceled." : ErrorText(error);
+                // A stop request does not turn a failed commit/rollback into
+                // cancellation. Preserve the real error and recovery details.
+                result->message = ErrorText(error);
                 if constexpr (!kSmokeBuild) {
                     if (job == Job::Apply || job == Job::Unlock || job == Job::Update || job == Job::Exit)
                         try { result->firewall = QueryFirewall(); } catch (...) {}
@@ -524,7 +563,7 @@ private:
         }); } catch (...) { SetBusy(false, job); throw; }
     }
     static void RefreshFirewall(Result& result, std::size_t fallbackCount) {
-        result.firewall = FirewallState{fallbackCount, true, L""};
+        result.firewall = FirewallState{fallbackCount, false, L"", 0, false};
         try { result.firewall = QueryFirewall(); }
         catch (const std::exception& error) { result.message += L" State verification failed: " + ErrorText(error); }
     }
@@ -622,7 +661,7 @@ private:
             (Result& result, std::stop_token stop) {
             std::string data = DownloadCatalog(stop);
             Catalog updated = ParseCatalog(data);
-            if (stop.stop_requested()) throw std::runtime_error("Canceled");
+            if (stop.stop_requested()) throw OperationCancelled();
             std::size_t count = 0;
             if (active) {
                 auto replacement = BuildRules(updated, applied.allowedRegions, applied.gamePath, NewGeneration());
@@ -716,13 +755,31 @@ private:
             Populate(selected);
         }
         if (result->firewall) {
-            firewallKnown_ = true;
+            firewallKnown_ = result->firewall->verified;
+            firewallEnabled_ = result->firewall->firewallEnabled;
             activeRules_ = result->firewall->ruleCount;
             legacyRules_ = result->firewall->legacyRuleCount;
         } else if (kind == Job::Initial || !result->success) firewallKnown_ = false;
         UpdateBadge();
         SetBusy(false, kind);
         SetStatus(result->message);
+        if constexpr (kSmokeBuild) {
+            if (kind == Job::Update && smokeStage_ == 6) {
+                smokeCancellationError_ = !result->success && !result->canceled
+                    && result->message.find(L"Injected rollback failure") != std::wstring::npos;
+                smokeStage_ = 7;
+                RunJob(Job::Update, [](Result&, std::stop_token) { throw OperationCancelled(); });
+                return;
+            }
+            if (kind == Job::Update && smokeStage_ == 7) {
+                smokeExplicitCancellation_ = !result->success && result->canceled;
+                smokePassed_ = smokePassed_ && smokeCancellationError_ && smokeExplicitCancellation_;
+                // Exit from a hidden window must leave background mode before cleanup.
+                HideToTray();
+                RequestExit();
+                return;
+            }
+        }
         if (kind == Job::Exit) {
             if (result->success) {
                 closing_ = true;
@@ -737,6 +794,7 @@ private:
         }
         if (exiting_) { RequestExit(); return; }
         if (!result->success && !result->canceled) {
+            ShowMain();
             const auto text = kind == Job::Initial ? L"Initialization did not complete. You can update data or remove leftover rules in this window.\n\n" : L"The operation did not complete.\n\n";
             MessageBoxEnglish(window_, (std::wstring(text) + result->message).c_str(), L"Region Lock", MB_OK | MB_ICONERROR);
         }
@@ -781,7 +839,7 @@ private:
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         data.uCallbackMessage = kTrayMessage;
         data.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(kIconId));
-        wcscpy_s(data.szTip, activeRules_ ? L"Region Lock - Lock active" : L"Region Lock - Unlocked");
+        wcscpy_s(data.szTip, (L"Region Lock - " + FirewallLabel()).c_str());
         if (!Shell_NotifyIconW(NIM_ADD, &data)) return false;
         data.uVersion = NOTIFYICON_VERSION_4;
         Shell_NotifyIconW(NIM_SETVERSION, &data);
@@ -797,7 +855,7 @@ private:
     void UpdateTrayTip() {
         if (!trayAdded_) return;
         NOTIFYICONDATAW data{sizeof(data)}; data.hWnd = window_; data.uID = kTrayId; data.uFlags = NIF_TIP;
-        wcscpy_s(data.szTip, activeRules_ ? L"Region Lock - Lock active" : L"Region Lock - Unlocked");
+        wcscpy_s(data.szTip, (L"Region Lock - " + FirewallLabel()).c_str());
         Shell_NotifyIconW(NIM_MODIFY, &data);
     }
     void HideToTray() {
@@ -807,15 +865,22 @@ private:
             return;
         }
         ShowWindow(window_, SW_HIDE);
+        UpdateResourceMode();
     }
     void ShowMain() {
+        resources_.SetBackground(false);
         ShowWindow(window_, IsIconic(window_) ? SW_RESTORE : SW_SHOW);
         SetForegroundWindow(window_);
         DeleteTray();
     }
+    void UpdateResourceMode() {
+        resources_.SetBackground(trayAdded_ && !IsWindowVisible(window_) && !trayMenuOpen_ && !exiting_);
+    }
     void TrayMenu() {
         HMENU menu = CreatePopupMenu();
         if (!menu) return;
+        trayMenuOpen_ = true;
+        resources_.SetBackground(false);
         MENUINFO info{sizeof(info)};
         info.fMask = MIM_BACKGROUND;
         info.hbrBack = surface_;
@@ -829,12 +894,15 @@ private:
         SetForegroundWindow(window_);
         const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, window_, nullptr);
         DestroyMenu(menu);
+        trayMenuOpen_ = false;
+        UpdateResourceMode();
         PostMessageW(window_, WM_NULL, 0, 0);
         if (command) SendMessageW(window_, WM_COMMAND, command, 0);
     }
     void RequestExit() {
         if (closing_) return;
         exiting_ = true;
+        resources_.SetBackground(false);
         if (busy_) {
             if (worker_.joinable()) worker_.request_stop();
             SetStatus(L"Finishing the current task, then unlocking regions and exiting...");
@@ -843,6 +911,9 @@ private:
         }
         if constexpr (kSmokeBuild) {
             smokeClosed_ = true;
+            smokeExitNormal_ = !resources_.Background() && !resources_.Idle() && !resources_.Eco()
+                && GetPriorityClass(GetCurrentProcess()) == smokeOriginalPriority_;
+            smokePassed_ = smokePassed_ && smokeExitNormal_;
             closing_ = true;
             DestroyWindow(window_);
             return;
@@ -975,6 +1046,16 @@ private:
                     return TRUE;
                 }, reinterpret_cast<LPARAM>(&smokeEnglish_));
                 smokeDark_ = ListView_GetBkColor(list_) == kSurface && ListView_GetTextBkColor(list_) == kSurface;
+                const auto initialCount = activeRules_;
+                const bool initialKnown = firewallKnown_, initialEnabled = firewallEnabled_;
+                activeRules_ = 1; firewallKnown_ = true; firewallEnabled_ = false;
+                UpdateBadge();
+                smokeFirewallStatus_ = WindowText(badge_) == L"Firewall off";
+                firewallKnown_ = false;
+                UpdateBadge();
+                smokeFirewallStatus_ = smokeFirewallStatus_ && WindowText(badge_) == L"State unknown";
+                activeRules_ = initialCount; firewallKnown_ = initialKnown; firewallEnabled_ = initialEnabled;
+                UpdateBadge();
                 UpdateWindow(window_);
                 smokeScreenshot_ = CaptureWindow();
                 const auto originalCheck = ListView_GetCheckState(list_, 0);
@@ -997,21 +1078,59 @@ private:
             } else if (smokeStage_ == 1) {
                 PROCESS_MEMORY_COUNTERS memory{sizeof(memory)};
                 if (GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory))) smokeWorkingSet_ = memory.WorkingSetSize;
+                smokeOriginalPriority_ = GetPriorityClass(GetCurrentProcess());
+                smokeOriginalThreadPriority_ = ThreadBasePriority();
+                MEMORY_PRIORITY_INFORMATION memoryPriority{};
+                smokeMemoryReadable_ = GetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority,
+                    &memoryPriority, sizeof(memoryPriority)) != FALSE;
+                smokeOriginalMemoryPriority_ = memoryPriority.MemoryPriority;
+                smokeOriginalPower_.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+                smokePowerReadable_ = GetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                    &smokeOriginalPower_, sizeof(smokeOriginalPower_)) != FALSE;
                 smokeCpuBaseline_ = CpuTime(); smokeStage_ = 2;
                 SetTimer(window_, kSmokeTimer, 2500, nullptr);
             } else if (smokeStage_ == 2) {
                 smokeVisibleCpu_ = CpuTime() - smokeCpuBaseline_;
                 SendMessageW(window_, WM_SYSCOMMAND, SC_MINIMIZE, 0);
                 smokeMinimized_ = !IsWindowVisible(window_) && trayAdded_;
+                smokeTrayPriority_ = GetPriorityClass(GetCurrentProcess());
+                smokeTrayThreadPriority_ = ThreadBasePriority();
+                smokeBackground_ = resources_.Background() && resources_.Idle() && resources_.BackgroundError() == ERROR_SUCCESS
+                    && smokeTrayPriority_ == IDLE_PRIORITY_CLASS;
+                MEMORY_PRIORITY_INFORMATION memoryPriority{};
+                if (GetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, &memoryPriority, sizeof(memoryPriority)))
+                    smokeTrayMemoryPriority_ = memoryPriority.MemoryPriority;
+                PROCESS_POWER_THROTTLING_STATE power{PROCESS_POWER_THROTTLING_CURRENT_VERSION};
+                smokeEco_ = !resources_.PowerReadable() || (resources_.Eco()
+                    && GetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &power, sizeof(power))
+                    && (power.ControlMask & power.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0);
                 smokeStage_ = 3;
                 SetTimer(window_, kSmokeTimer, 250, nullptr);
             } else if (smokeStage_ == 3) {
+                GetProcessIoCounters(GetCurrentProcess(), &smokeIoBaseline_);
                 smokeCpuBaseline_ = CpuTime(); smokeStage_ = 4;
                 SetTimer(window_, kSmokeTimer, 2500, nullptr);
             } else if (smokeStage_ == 4) {
                 smokeHiddenCpu_ = CpuTime() - smokeCpuBaseline_;
+                IO_COUNTERS io{};
+                if (GetProcessIoCounters(GetCurrentProcess(), &io))
+                    smokeHiddenIoBytes_ = io.ReadTransferCount + io.WriteTransferCount
+                        - smokeIoBaseline_.ReadTransferCount - smokeIoBaseline_.WriteTransferCount;
+                PROCESS_MEMORY_COUNTERS_EX memory{}; memory.cb = sizeof(memory);
+                if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory), sizeof(memory))) {
+                    smokeTrayWorkingSet_ = memory.WorkingSetSize;
+                    smokePrivateBytes_ = memory.PrivateUsage;
+                }
                 ShowMain();
                 smokeRestored_ = IsWindowVisible(window_) && !trayAdded_;
+                PROCESS_POWER_THROTTLING_STATE power{PROCESS_POWER_THROTTLING_CURRENT_VERSION};
+                MEMORY_PRIORITY_INFORMATION memoryPriority{};
+                smokeResourceRestored_ = !resources_.Background() && !resources_.Idle() && !resources_.Eco()
+                    && GetPriorityClass(GetCurrentProcess()) == smokeOriginalPriority_
+                    && (!smokeMemoryReadable_ || (GetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority,
+                        &memoryPriority, sizeof(memoryPriority)) && memoryPriority.MemoryPriority == smokeOriginalMemoryPriority_))
+                    && (!smokePowerReadable_ || (GetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &power, sizeof(power))
+                        && power.ControlMask == smokeOriginalPower_.ControlMask && power.StateMask == smokeOriginalPower_.StateMask));
                 ShowWindow(window_, SW_MAXIMIZE);
                 SendMessageW(window_, WM_SYSCOMMAND, SC_MINIMIZE, 0);
                 ShowMain();
@@ -1041,8 +1160,18 @@ private:
                 smokePassed_ = loaded_ && smokeScreenshot_ && smokeMinimized_ && smokeRestored_
                     && smokeDark_ && smokeEnglish_ && smokeMaximizedRestore_
                     && smokeBusyDark_ && smokeBusyReadOnly_ && smokeReadyEditable_ && smokeSingleInstance_
+                    && smokeBackground_ && smokeEco_ && smokeResourceRestored_
+                    && smokeFirewallStatus_
                     && smokeVisibleCpu_ <= 1000000 && smokeHiddenCpu_ <= 1000000;
-                SendMessageW(window_, WM_CLOSE, 0, 0);
+                smokeStage_ = 6;
+                RunJob(Job::Update, [](Result&, std::stop_token stop) {
+                    std::mutex mutex;
+                    std::unique_lock lock(mutex);
+                    std::condition_variable_any condition;
+                    condition.wait(lock, stop, [] { return false; });
+                    throw std::runtime_error("Injected rollback failure after cancellation request");
+                });
+                worker_.request_stop();
             }
         }
     }
@@ -1063,9 +1192,29 @@ private:
             << ",\n  \"busy_selection_read_only\": " << (smokeBusyReadOnly_ ? "true" : "false")
             << ",\n  \"ready_selection_editable\": " << (smokeReadyEditable_ ? "true" : "false")
             << ",\n  \"single_instance_restores_tray_window\": " << (smokeSingleInstance_ ? "true" : "false")
+            << ",\n  \"tray_background_mode\": " << (smokeBackground_ ? "true" : "false")
+            << ",\n  \"background_mode_error\": " << resources_.BackgroundError()
+            << ",\n  \"priority_change_error\": " << resources_.PriorityError()
+            << ",\n  \"power_throttling_error\": " << resources_.PowerError()
+            << ",\n  \"power_throttling_query_available\": " << (smokePowerReadable_ ? "true" : "false")
+            << ",\n  \"tray_priority_class\": " << smokeTrayPriority_
+            << ",\n  \"visible_thread_base_priority\": " << smokeOriginalThreadPriority_
+            << ",\n  \"tray_thread_base_priority\": " << smokeTrayThreadPriority_
+            << ",\n  \"tray_memory_priority\": " << smokeTrayMemoryPriority_
+            << ",\n  \"visible_memory_priority\": " << smokeOriginalMemoryPriority_
+            << ",\n  \"tray_eco_qos_policy_readable\": " << (resources_.PowerReadable() ? "true" : "false")
+            << ",\n  \"tray_eco_qos_verified_or_unavailable\": " << (smokeEco_ ? "true" : "false")
+            << ",\n  \"foreground_resource_policy_restored\": " << (smokeResourceRestored_ ? "true" : "false")
+            << ",\n  \"exit_leaves_background_mode\": " << (smokeExitNormal_ ? "true" : "false")
+            << ",\n  \"cancellation_preserves_real_errors\": " << (smokeCancellationError_ ? "true" : "false")
+            << ",\n  \"explicit_cancellation_recognized\": " << (smokeExplicitCancellation_ ? "true" : "false")
+            << ",\n  \"firewall_status_not_overstated\": " << (smokeFirewallStatus_ ? "true" : "false")
             << ",\n  \"visible_idle_cpu_ms_over_2500ms\": " << static_cast<double>(smokeVisibleCpu_) / 10000.0
             << ",\n  \"tray_idle_cpu_ms_over_2500ms\": " << static_cast<double>(smokeHiddenCpu_) / 10000.0
             << ",\n  \"working_set_bytes\": " << smokeWorkingSet_
+            << ",\n  \"tray_working_set_bytes\": " << smokeTrayWorkingSet_
+            << ",\n  \"tray_private_bytes\": " << smokePrivateBytes_
+            << ",\n  \"tray_idle_io_bytes_over_2500ms\": " << smokeHiddenIoBytes_
             << ",\n  \"firewall_mutations\": 0\n}\n";
         try { WriteFileAtomic(options_.report, json.str()); }
         catch (...) { smokePassed_ = false; }
@@ -1163,6 +1312,7 @@ private:
         case WM_QUERYENDSESSION: return TRUE;
         case WM_ENDSESSION:
             if (wparam) {
+                resources_.SetBackground(false);
                 // Stop/drain the writer before cleanup so it cannot recreate rules after shutdown cleanup.
                 if (worker_.joinable()) { worker_.request_stop(); worker_.join(); }
                 if constexpr (!kSmokeBuild) { try { RemoveOwnedRules(); } catch (...) {} }

@@ -28,8 +28,10 @@ If a required firewall service is stopped, the program reports the cause without
 - Only entries whose service is exactly `EC2` are accepted. JSON, region codes, and CIDR ranges are validated; both IPv4 and IPv6 are supported, and regions are listed dynamically.
 - Address ranges are normalized, deduplicated, and merged without changing their coverage. Rules are split into bounded batches. If selected and blocked regions overlap, applying is rejected to avoid blocking a selected region.
 - A complete new generation of rules is installed before the old generation is removed. Failures trigger an attempted rollback and a reported result. Windows Firewall COM provides no transaction across multiple rules, so both generations can briefly apply during a change.
+- If restoring an old generation fails after a complete replacement was installed, the complete replacement is retained to avoid leaving only partial coverage. The error identifies this recovery state; unlock or reapply before continuing. Cancellation does not hide commit or rollback failures.
 - Catalog and settings replacements are validated before installation. Downloads and files have size limits, and network operations have timeouts.
 - Network tests show successful replies and the median latency of successful samples.
+- The status badge and tray tooltip report an unknown state after verification fails, and report a disabled firewall instead of claiming that installed rules are active. State checks run at startup and after rule operations; there is no periodic firewall polling.
 
 The network test sends five UDP probes to the AWS GameLift beacon at `gamelift-ping.<region>.api.aws:7770`, limits the send rate, and validates replies. These results are a reference for the AWS beacon, **not live game-server latency**, and do not prove that region locking works. Some EC2 regions have no corresponding beacon; unavailable tests report the reason.
 
@@ -42,6 +44,10 @@ Compatibility depends on how the accelerator redirects or tunnels game traffic. 
 ## Performance
 
 The native Win32 message loop waits for system messages when idle. There is no continuous drawing, per-frame scanning, or periodic network polling, including while hidden in the tray. Downloads, probes, and firewall operations start background work only when needed; exit cancels and joins outstanding work.
+
+Hiding to the tray selects the Idle CPU priority class and enters Windows process background mode, lowering this application's disk I/O and memory scheduling priorities. It also requests EcoQoS execution scheduling where supported and its prior policy can be read for restoration. Foreground restoration, tray menu interaction, and unlock-and-exit restore the original scheduling policy. Existing firewall rules remain installed and are evaluated by Windows independently of the UI process's priority. User-requested background operations continue at the lower priority and may take longer under load.
+
+This uses [Windows background processing mode](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setpriorityclass) and [process power throttling](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setprocessinformation). It does not suspend the process, raise game priority, pin CPU cores, trim the working set, or periodically flush memory. The goal is low interference with foreground work; Windows still schedules the app when an event needs handling.
 
 Release builds target x64 with the static C/C++ runtime, `/O2`, `/GL` + `/LTCG`, and unused function/data removal and folding. CFG, ASLR, and DEP remain enabled. AVX2 is not required. The program does not change the system power plan, request realtime process priority, or adjust global network settings.
 

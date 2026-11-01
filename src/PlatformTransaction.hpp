@@ -33,6 +33,12 @@ void ReplaceRulesTransaction(std::size_t newCount, std::size_t oldCount,
             try { restoreOld(i); }
             catch (...) { rollback += " Restore old rule #" + std::to_string(i) + ": " + CurrentExceptionMessage(); }
         }
+        // Once a complete replacement exists, never discard it if restoring
+        // the old generation failed. That would leave only partial coverage.
+        if (!rollback.empty() && newCount && added == newCount) {
+            throw std::runtime_error(original + ". ROLLBACK INCOMPLETE:" + rollback
+                + ". The complete new generation was retained; some previous rules may also remain. Unlock or reapply to recover.");
+        }
         for (std::size_t i = added; i > 0; --i) {
             try { removeNew(i - 1); }
             catch (...) { rollback += " Remove new rule #" + std::to_string(i - 1) + ": " + CurrentExceptionMessage(); }

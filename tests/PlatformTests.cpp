@@ -105,6 +105,12 @@ void FileAndSettingsTests(const std::filesystem::path& directory) {
     invalid.allowedRegions.push_back(invalid.allowedRegions.front());
     MustThrow([&] { SaveSettings(paths, invalid); }, "Duplicate regions were persisted");
     Require(ReadFile(paths.settingsFile) == goodBytes, "Duplicate region save destroyed settings");
+    for (const auto* code : {"-region", "region-"}) {
+        invalid = selected;
+        invalid.allowedRegions.push_back(code);
+        MustThrow([&] { SaveSettings(paths, invalid); }, "Malformed region boundary was persisted");
+        Require(ReadFile(paths.settingsFile) == goodBytes, "Malformed region save destroyed settings");
+    }
 
     const std::string malformed[] = {
         "not UTF-16",
@@ -113,6 +119,8 @@ void FileAndSettingsTests(const std::filesystem::path& directory) {
         Utf16File(L"[Other]\r\ngamePath=\r\nallowedRegions=ap-northeast-1\r\n"),
         Utf16File(L"[RegionLock]\r\ngamePath=\r\n"),
         Utf16File(L"[RegionLock]\r\ngamePath=\r\nallowedRegions=ap-northeast-1,\r\n"),
+        Utf16File(L"[RegionLock]\r\ngamePath=\r\nallowedRegions=-region\r\n"),
+        Utf16File(L"[RegionLock]\r\ngamePath=\r\nallowedRegions=region-\r\n"),
         Utf16File(L"[RegionLock]\r\ngamePath=\r\nallowedRegions=ap-northeast-1,ap-northeast-1\r\n"),
         Utf16File(L"[RegionLock]\r\ngamePath=\r\nallowedRegions=\r\nallowedRegions=ap-northeast-1\r\n"),
         Utf16File(L"[RegionLock]\r\ngamePath=\r\nallowedRegions=\r\n[RegionLock]\r\n"),
@@ -135,6 +143,17 @@ void FileAndSettingsTests(const std::filesystem::path& directory) {
         if (entry.path().extension() == L".tmp") ++temporaryCount;
     }
     Require(temporaryCount == 0, "Atomic file writes left temporary files behind");
+
+    const auto originalDirectory = std::filesystem::current_path();
+    std::filesystem::current_path(directory);
+    try {
+        WriteFileAtomic(L"relative-report.json", "relative output");
+        Require(ReadFile(L"relative-report.json") == "relative output", "Relative atomic output failed");
+    } catch (...) {
+        std::filesystem::current_path(originalDirectory);
+        throw;
+    }
+    std::filesystem::current_path(originalDirectory);
 }
 
 void CancellationAndIdentifiers() {
@@ -145,7 +164,10 @@ void CancellationAndIdentifiers() {
     std::stop_source cancellation;
     cancellation.request_stop();
     const auto start = std::chrono::steady_clock::now();
-    MustThrow([&] { DownloadCatalog(cancellation.get_token()); }, "Cancelled catalog download did not abort");
+    bool canceled{};
+    try { DownloadCatalog(cancellation.get_token()); }
+    catch (const OperationCancelled&) { canceled = true; }
+    Require(canceled, "Cancelled download did not report explicit cancellation");
     const auto probe = ProbeRegion("ap-northeast-1", cancellation.get_token());
     Require(probe.received == 0 && probe.total == 5 && !probe.error.empty(), "Cancelled beacon probe reported success");
     Require(std::chrono::steady_clock::now() - start < std::chrono::seconds(1), "Pre-cancelled operations performed blocking work");
@@ -222,17 +244,40 @@ void TransactionTests() {
     MockRules unlock;
     unlock.unlocking = true;
     Require(unlock.Run().empty() && std::none_of(unlock.old.begin(), unlock.old.end(), [](bool value) { return value; }), "Successful unlock left owned rules installed");
-    MockRules rollbackFailure;
-    rollbackFailure.failRemove = 2;
-    rollbackFailure.failRestore = 0;
-    rollbackFailure.failCleanup = 1;
-    const auto error = rollbackFailure.Run();
+    for (int index = 0; index < 2; ++index) {
+        MockRules rollbackFailure;
+        rollbackFailure.failRemove = 2;
+        rollbackFailure.failRestore = index;
+        const auto error = rollbackFailure.Run();
+        Require(error.find("ROLLBACK INCOMPLETE") != std::string::npos &&
+            error.find("injected old removal failure") != std::string::npos &&
+            error.find("injected restore failure") != std::string::npos &&
+            error.find("complete new generation was retained") != std::string::npos,
+            "Failed restore did not report retained replacement coverage");
+        Require(!rollbackFailure.old[index] && rollbackFailure.old[1 - index] && rollbackFailure.old[2],
+            "Restore rollback stopped after first failure");
+        Require(std::all_of(rollbackFailure.added.begin(), rollbackFailure.added.end(), [](bool value) { return value; }),
+            "Failed old restore discarded the complete replacement and left partial coverage");
+    }
+    MockRules cleanupFailure;
+    cleanupFailure.failAdd = 3;
+    cleanupFailure.failCleanup = 1;
+    const auto error = cleanupFailure.Run();
     Require(error.find("ROLLBACK INCOMPLETE") != std::string::npos &&
-        error.find("injected old removal failure") != std::string::npos &&
-        error.find("injected restore failure") != std::string::npos &&
-        error.find("injected cleanup failure") != std::string::npos, "Rollback failures were hidden or original error was lost");
-    Require(!rollbackFailure.old[0] && rollbackFailure.old[1] && rollbackFailure.old[2], "Restore rollback stopped after first failure");
-    Require(!rollbackFailure.added[0] && rollbackFailure.added[1] && !rollbackFailure.added[2] && !rollbackFailure.added[3], "Cleanup rollback stopped after first failure");
+        error.find("injected install failure") != std::string::npos &&
+        error.find("injected cleanup failure") != std::string::npos, "Partial install cleanup failures were hidden");
+    Require(std::all_of(cleanupFailure.old.begin(), cleanupFailure.old.end(), [](bool value) { return value; }),
+        "Partial install lost old coverage");
+    Require(!cleanupFailure.added[0] && cleanupFailure.added[1] && !cleanupFailure.added[2] && !cleanupFailure.added[3],
+        "Cleanup rollback stopped after first failure");
+
+    MockRules failedUnlock;
+    failedUnlock.unlocking = true;
+    failedUnlock.failRemove = 2;
+    failedUnlock.failRestore = 0;
+    Require(failedUnlock.Run().find("ROLLBACK INCOMPLETE") != std::string::npos,
+        "Incomplete unlock rollback was hidden");
+    Require(failedUnlock.old[1] && failedUnlock.old[2], "Unlock recovery stopped after a restore failure");
 }
 } // namespace
 
