@@ -1,0 +1,12 @@
+/build/
+/dist/
+/artifacts/
+/.vs/
+CMakeUserPresets.json
+*.user
+*.pdb
+/Samples/
+*.log
+.env
+.env.*
+!.env.example
