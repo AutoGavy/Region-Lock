@@ -10,6 +10,8 @@ Native Windows region selection for Battlefield 6. English interface, dark theme
 2. Run the EXE, select `bf6.exe`, check allowed regions, and click **Apply lock**.
 3. Restart the game after changing regions.
 
+Click a region row, then **Test region** to test it, or choose **Test all**.
+
 Minimize to keep the lock active in the tray with low resource priority. Close to **unlock regions and exit**.
 
 **Update data** refreshes the official AWS IP ranges. Rules affect only the selected game. AWS ranges are not an official Battlefield server list; matchmaking results are not guaranteed.

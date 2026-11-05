@@ -59,7 +59,7 @@ constexpr COLORREF kMuted = RGB(137, 150, 171);
 constexpr COLORREF kBorder = RGB(39, 47, 61);
 enum ControlId : int {
     GamePath = 1001, Browse, Detect, RegionList, SelectAll, SelectNone,
-    Apply, Unlock, Test, Update, Cancel, ShowWindowCommand, ExitCommand
+    Apply, Unlock, Test, Update, Cancel, ShowWindowCommand, ExitCommand, TestAll
 };
 enum class Job { Initial, Apply, Unlock, Update, Probe, Exit };
 #ifdef REGIONLOCK_SMOKE
@@ -191,7 +191,7 @@ private:
     UINT dpi_{96};
     HWND title_{}, subtitle_{}, badge_{}, gameLabel_{}, path_{}, browse_{}, detect_{};
     HWND hint_{}, regionsLabel_{}, selectionLabel_{}, list_{}, all_{}, none_{};
-    HWND dataLabel_{}, apply_{}, unlock_{}, test_{}, update_{}, cancel_{}, status_{};
+    HWND dataLabel_{}, apply_{}, unlock_{}, test_{}, testAll_{}, update_{}, cancel_{}, status_{};
     Paths paths_;
     Settings settings_;
     Settings appliedSettings_;
@@ -203,6 +203,7 @@ private:
     bool firewallKnown_{}, firewallEnabled_{}, preferencesReady_{}, trayMenuOpen_{};
     std::size_t activeRules_{}, probeCompleted_{}, legacyRules_{};
     std::vector<std::wstring> probeDetails_;
+    std::vector<int> probeRows_;
     UINT taskbarCreated_{};
     Options options_;
     bool smokePassed_{true}, smokeClosed_{}, smokeMinimized_{}, smokeRestored_{};
@@ -212,6 +213,8 @@ private:
     bool smokeBackground_{}, smokeEco_{}, smokeResourceRestored_{}, smokeExitNormal_{};
     bool smokeCancellationError_{}, smokeExplicitCancellation_{};
     bool smokeFirewallStatus_{};
+    bool smokeSingleProbe_{}, smokeAllProbes_{}, smokeCanceledProbe_{}, smokeNoProbeTarget_{}, smokeHoldProbes_{};
+    std::vector<std::string> smokeAllowedBeforeProbe_;
     DWORD smokeOriginalPriority_{}, smokeTrayPriority_{};
     ULONG smokeTrayMemoryPriority_{};
     ULONG smokeOriginalMemoryPriority_{};
@@ -265,7 +268,7 @@ private:
         // Only allow the pointer-free taskbar recreation notification through UIPI.
         if (taskbarCreated_) ChangeWindowMessageFilterEx(window_, taskbarCreated_, MSGFLT_ALLOW, nullptr);
         title_ = Control(L"STATIC", L"Region Lock", SS_LEFT);
-        subtitle_ = Control(L"STATIC", L"Choose where Battlefield 6 can match.", SS_LEFT);
+        subtitle_ = Control(L"STATIC", L"Choose where Battlefield 6 can match. Select a row to test one region.", SS_LEFT);
         badge_ = Control(L"STATIC", L"Loading...", SS_RIGHT);
         gameLabel_ = Control(L"STATIC", L"Game executable", SS_LEFT);
         path_ = Control(L"EDIT", L"", ES_AUTOHSCROLL | ES_READONLY | WS_TABSTOP, GamePath);
@@ -276,7 +279,7 @@ private:
         selectionLabel_ = Control(L"STATIC", L"", SS_RIGHT);
         all_ = Control(L"BUTTON", L"All", BS_OWNERDRAW | WS_TABSTOP, SelectAll);
         none_ = Control(L"BUTTON", L"None", BS_OWNERDRAW | WS_TABSTOP, SelectNone);
-        list_ = Control(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS | WS_TABSTOP,
+        list_ = Control(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS | WS_TABSTOP,
             RegionList);
         ListView_SetExtendedListViewStyle(list_, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP);
         ListView_SetBkColor(list_, kSurface);
@@ -305,7 +308,8 @@ private:
         dataLabel_ = Control(L"STATIC", L"Loading region data...", SS_LEFT);
         apply_ = Control(L"BUTTON", L"Apply lock", BS_OWNERDRAW | WS_TABSTOP, Apply);
         unlock_ = Control(L"BUTTON", L"Unlock", BS_OWNERDRAW | WS_TABSTOP, Unlock);
-        test_ = Control(L"BUTTON", L"Test network", BS_OWNERDRAW | WS_TABSTOP, Test);
+        test_ = Control(L"BUTTON", L"Test region", BS_OWNERDRAW | WS_TABSTOP, Test);
+        testAll_ = Control(L"BUTTON", L"Test all", BS_OWNERDRAW | WS_TABSTOP, TestAll);
         update_ = Control(L"BUTTON", L"Update data", BS_OWNERDRAW | WS_TABSTOP, Update);
         cancel_ = Control(L"BUTTON", L"Cancel", BS_OWNERDRAW | WS_TABSTOP, Cancel);
         status_ = Control(L"STATIC", L"", SS_LEFT);
@@ -441,7 +445,8 @@ private:
         place(apply_, 24, height - 97, 136, 39);
         place(unlock_, 172, height - 97, 108, 39);
         place(test_, 292, height - 97, 112, 39);
-        place(update_, 416, height - 97, 140, 39);
+        place(testAll_, 416, height - 97, 100, 39);
+        place(update_, 528, height - 97, 140, 39);
         place(cancel_, width - 140, height - 97, 116, 39);
         place(status_, 25, height - 46, width - 50, 40);
         const int fixed[] = {0, 195, 92, 92, 95, 95};
@@ -473,12 +478,17 @@ private:
         // Keep it enabled for dark rendering and scrolling; veto check edits while busy.
         EnableWindow(apply_, !busy && loaded_);
         EnableWindow(unlock_, !busy);
-        EnableWindow(test_, !busy && loaded_);
+        UpdateProbeButtons();
         EnableWindow(update_, !busy);
         ShowWindow(cancel_, busy && (job == Job::Probe || job == Job::Update) ? SW_SHOW : SW_HIDE);
         EnableWindow(cancel_, busy);
         InvalidateRect(apply_, nullptr, TRUE);
         UpdateResourceMode();
+    }
+    void UpdateProbeButtons() {
+        const int row = ListView_GetNextItem(list_, -1, LVNI_SELECTED);
+        EnableWindow(test_, !busy_ && loaded_ && row >= 0 && static_cast<std::size_t>(row) < catalog_.regions.size());
+        EnableWindow(testAll_, !busy_ && loaded_);
     }
     std::vector<std::string> Selection() const {
         std::vector<std::string> selected;
@@ -688,20 +698,32 @@ private:
             RefreshFirewall(result, count);
         });
     }
-    void BeginProbe() {
+    void BeginProbe(bool allRegions) {
         if (busy_ || !loaded_) return;
-        if constexpr (kSmokeBuild) { SetStatus(L"Network tests are disabled in the smoke-test build. "); return; }
-        std::vector<std::string> codes;
-        codes.reserve(catalog_.regions.size());
-        for (const auto& region : catalog_.regions) codes.push_back(region.code);
-        for (int i = 0; i < ListView_GetItemCount(list_); ++i) {
-            ListView_SetItemText(list_, i, 4, const_cast<wchar_t*>(L"Pending..."));
-            ListView_SetItemText(list_, i, 5, const_cast<wchar_t*>(L"—"));
+        std::vector<int> rows;
+        if (allRegions) {
+            for (int i = 0; i < ListView_GetItemCount(list_); ++i) rows.push_back(i);
+        } else {
+            const int row = ListView_GetNextItem(list_, -1, LVNI_SELECTED);
+            if (row < 0 || static_cast<std::size_t>(row) >= catalog_.regions.size()) {
+                SetStatus(L"Select a region row, then choose Test region.");
+                return;
+            }
+            rows.push_back(row);
         }
-        std::fill(probeDetails_.begin(), probeDetails_.end(), L"");
+        std::vector<std::string> codes;
+        codes.reserve(rows.size());
+        for (int row : rows) {
+            codes.push_back(catalog_.regions[static_cast<std::size_t>(row)].code);
+            ListView_SetItemText(list_, row, 4, const_cast<wchar_t*>(L"Pending..."));
+            ListView_SetItemText(list_, row, 5, const_cast<wchar_t*>(L"—"));
+            probeDetails_[static_cast<std::size_t>(row)].clear();
+        }
+        probeRows_ = std::move(rows);
         probeCompleted_ = 0;
-        SetStatus(L"Testing up to 4 regions at once, with 5 UDP requests per region...");
-        RunJob(Job::Probe, [this, codes = std::move(codes)](Result& result, std::stop_token stop) {
+        SetStatus(allRegions ? L"Testing all regions, up to 4 at once, with 5 UDP requests per region..."
+            : L"Testing " + catalog_.regions[static_cast<std::size_t>(probeRows_.front())].name + L", with 5 UDP requests...");
+        try { RunJob(Job::Probe, [this, codes = std::move(codes)](Result& result, std::stop_token stop) {
             std::atomic<std::size_t> next{};
             std::vector<std::jthread> workers;
             const auto concurrency = std::min<std::size_t>(4, codes.size());
@@ -711,20 +733,49 @@ private:
                         const auto index = next.fetch_add(1, std::memory_order_relaxed);
                         if (index >= codes.size()) return;
                         auto probe = std::make_unique<ProbeResult>();
-                        try { *probe = ProbeRegion(codes[index], stop); }
+                        try {
+                            if constexpr (kSmokeBuild) {
+                                // Exercise the production UI/task path without sending packets.
+                                if (smokeHoldProbes_) {
+                                    std::mutex mutex;
+                                    std::unique_lock lock(mutex);
+                                    std::condition_variable_any condition;
+                                    condition.wait(lock, stop, [] { return false; });
+                                }
+                                probe->code = codes[index]; probe->received = 5; probe->medianMs = 42;
+                            } else { *probe = ProbeRegion(codes[index], stop); }
+                        }
                         catch (const std::exception& error) { probe->code = codes[index]; probe->error = ErrorText(error); }
+                        if (stop.stop_requested()) return;
                         if (PostMessageW(window_, kProbeDone, 0, reinterpret_cast<LPARAM>(probe.get()))) probe.release();
                     }
                 });
             }
             workers.clear();
+            result.canceled = stop.stop_requested();
             result.message = stop.stop_requested() ? L"Network test canceled. Completed results have been kept." :
                 L"Test complete. Median GameLift latency and replies out of 5 requests; not live game-server latency.";
-        });
+        }); } catch (...) { FinishProbeRows(L"Unavailable"); throw; }
+    }
+    std::wstring ProbeCell(int row, int column) const {
+        wchar_t text[128]{};
+        ListView_GetItemText(list_, row, column, text, static_cast<int>(std::size(text)));
+        return text;
+    }
+    void FinishProbeRows(const wchar_t* unfinished) {
+        for (int row : probeRows_) {
+            if (ProbeCell(row, 4) != L"Pending...") continue;
+            ListView_SetItemText(list_, row, 4, const_cast<wchar_t*>(unfinished));
+            probeDetails_[static_cast<std::size_t>(row)] = unfinished;
+        }
     }
     void ShowProbe(std::unique_ptr<ProbeResult> probe) {
-        for (std::size_t i = 0; i < catalog_.regions.size(); ++i) {
+        if (!busy_ || job_ != Job::Probe) return;
+        bool matched{};
+        for (int row : probeRows_) {
+            const auto i = static_cast<std::size_t>(row);
             if (catalog_.regions[i].code != probe->code) continue;
+            matched = true;
             std::wstring latency = probe->received > 0 ? std::to_wstring(static_cast<long long>(std::llround(probe->medianMs))) + L" ms" : L"No reply";
             if (!probe->error.empty() && !probe->received) latency = L"Unavailable";
             std::wstring quality = std::to_wstring(probe->total ? probe->received * 100 / probe->total : 0) + L"% ("
@@ -735,12 +786,14 @@ private:
                 L"GameLift UDP beacon: median of successful replies out of 5 requests, not live game-server latency." : probe->error;
             break;
         }
+        if (!matched) return;
         ++probeCompleted_;
-        SetStatus(L"Testing " + Number(probeCompleted_) + L" / " + Number(catalog_.regions.size()) + L" regions...");
+        SetStatus(L"Testing " + Number(probeCompleted_) + L" / " + Number(probeRows_.size()) + L" regions...");
     }
     void FinishJob(std::unique_ptr<Result> result) {
         if (worker_.joinable()) worker_.join();
         const auto kind = result->job;
+        if (kind == Job::Probe) FinishProbeRows(result->canceled ? L"Canceled" : L"Unavailable");
         if (result->settings) {
             settings_ = *result->settings;
             if (kind == Job::Initial || kind == Job::Apply) preferencesReady_ = true;
@@ -774,9 +827,45 @@ private:
             if (kind == Job::Update && smokeStage_ == 7) {
                 smokeExplicitCancellation_ = !result->success && result->canceled;
                 smokePassed_ = smokePassed_ && smokeCancellationError_ && smokeExplicitCancellation_;
+                StartProbeSmoke();
+                return;
+            }
+            if (kind == Job::Probe && smokeStage_ == 8) {
+                smokeSingleProbe_ = smokeSingleProbe_ && result->success && !result->canceled && probeCompleted_ == 1
+                    && ProbeCell(1, 4) == L"42 ms" && ProbeCell(1, 5) == L"100% (5/5)"
+                    && Selection() == smokeAllowedBeforeProbe_;
+                for (int row = 0; row < ListView_GetItemCount(list_); ++row) {
+                    if (row == 1) continue;
+                    smokeSingleProbe_ = smokeSingleProbe_ && ProbeCell(row, 4) == L"Old latency"
+                        && ProbeCell(row, 5) == L"Old replies" && probeDetails_[static_cast<std::size_t>(row)] == L"Previous result";
+                }
+                smokeStage_ = 9;
+                SendMessageW(window_, WM_COMMAND, TestAll, 0);
+                smokeAllProbes_ = busy_ && probeRows_.size() == catalog_.regions.size();
+                return;
+            }
+            if (kind == Job::Probe && smokeStage_ == 9) {
+                smokeAllProbes_ = smokeAllProbes_ && result->success && !result->canceled
+                    && probeCompleted_ == catalog_.regions.size() && Selection() == smokeAllowedBeforeProbe_;
+                for (int row = 0; row < ListView_GetItemCount(list_); ++row)
+                    smokeAllProbes_ = smokeAllProbes_ && ProbeCell(row, 4) == L"42 ms" && ProbeCell(row, 5) == L"100% (5/5)";
+                smokeStage_ = 10;
+                ListView_SetItemState(list_, 2, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+                smokeHoldProbes_ = true;
+                SendMessageW(window_, WM_COMMAND, Test, 0);
+                smokeCanceledProbe_ = busy_ && probeRows_ == std::vector<int>{2};
+                SendMessageW(window_, WM_COMMAND, Cancel, 0);
+                return;
+            }
+            if (kind == Job::Probe && smokeStage_ == 10) {
+                smokeHoldProbes_ = false;
+                smokeCanceledProbe_ = smokeCanceledProbe_ && result->canceled && probeCompleted_ == 0
+                    && ProbeCell(2, 4) == L"Canceled" && ProbeCell(1, 4) == L"42 ms"
+                    && IsWindowEnabled(test_) && IsWindowEnabled(testAll_) && Selection() == smokeAllowedBeforeProbe_;
+                smokePassed_ = smokePassed_ && smokeNoProbeTarget_ && smokeSingleProbe_ && smokeAllProbes_ && smokeCanceledProbe_;
+                CaptureWindow();
                 // Exit from a hidden window must leave background mode before cleanup.
-                HideToTray();
-                RequestExit();
+                HideToTray(); RequestExit();
                 return;
             }
         }
@@ -1031,6 +1120,25 @@ private:
         smokeSecondStarted_ = GetTickCount64();
         return true;
     }
+    void StartProbeSmoke() {
+        if constexpr (kSmokeBuild) {
+            smokeAllowedBeforeProbe_ = Selection();
+            ListView_SetItemState(list_, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+            smokeNoProbeTarget_ = !IsWindowEnabled(test_) && IsWindowEnabled(testAll_);
+            SendMessageW(window_, WM_COMMAND, Test, 0);
+            smokeNoProbeTarget_ = smokeNoProbeTarget_ && !busy_;
+            for (int row = 0; row < ListView_GetItemCount(list_); ++row) {
+                ListView_SetItemText(list_, row, 4, const_cast<wchar_t*>(L"Old latency"));
+                ListView_SetItemText(list_, row, 5, const_cast<wchar_t*>(L"Old replies"));
+                probeDetails_[static_cast<std::size_t>(row)] = L"Previous result";
+            }
+            ListView_SetItemState(list_, 1, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+            smokeStage_ = 8;
+            SendMessageW(window_, WM_COMMAND, Test, 0);
+            smokeSingleProbe_ = busy_ && job_ == Job::Probe && probeRows_ == std::vector<int>{1}
+                && !IsWindowEnabled(test_) && !IsWindowEnabled(testAll_) && Selection() == smokeAllowedBeforeProbe_;
+        }
+    }
     void SmokeStep() {
         if constexpr (kSmokeBuild) {
             if (smokeStage_ == 0) {
@@ -1209,13 +1317,17 @@ private:
             << ",\n  \"cancellation_preserves_real_errors\": " << (smokeCancellationError_ ? "true" : "false")
             << ",\n  \"explicit_cancellation_recognized\": " << (smokeExplicitCancellation_ ? "true" : "false")
             << ",\n  \"firewall_status_not_overstated\": " << (smokeFirewallStatus_ ? "true" : "false")
+            << ",\n  \"single_region_probe_preserves_other_results\": " << (smokeSingleProbe_ ? "true" : "false")
+            << ",\n  \"all_regions_probe\": " << (smokeAllProbes_ ? "true" : "false")
+            << ",\n  \"single_region_probe_cancellation\": " << (smokeCanceledProbe_ ? "true" : "false")
+            << ",\n  \"probe_requires_selected_row\": " << (smokeNoProbeTarget_ ? "true" : "false")
             << ",\n  \"visible_idle_cpu_ms_over_2500ms\": " << static_cast<double>(smokeVisibleCpu_) / 10000.0
             << ",\n  \"tray_idle_cpu_ms_over_2500ms\": " << static_cast<double>(smokeHiddenCpu_) / 10000.0
             << ",\n  \"working_set_bytes\": " << smokeWorkingSet_
             << ",\n  \"tray_working_set_bytes\": " << smokeTrayWorkingSet_
             << ",\n  \"tray_private_bytes\": " << smokePrivateBytes_
             << ",\n  \"tray_idle_io_bytes_over_2500ms\": " << smokeHiddenIoBytes_
-            << ",\n  \"firewall_mutations\": 0\n}\n";
+            << ",\n  \"firewall_mutations\": 0,\n  \"network_requests\": 0\n}\n";
         try { WriteFileAtomic(options_.report, json.str()); }
         catch (...) { smokePassed_ = false; }
         }
@@ -1253,7 +1365,8 @@ private:
             case SelectNone: if (!busy_) SelectEvery(false); break;
             case Apply: case IDOK: BeginApply(); break;
             case Unlock: BeginUnlock(); break;
-            case Test: BeginProbe(); break;
+            case Test: BeginProbe(false); break;
+            case TestAll: BeginProbe(true); break;
             case Update: BeginUpdate(); break;
             case Cancel: if (worker_.joinable()) { worker_.request_stop(); EnableWindow(cancel_, FALSE); SetStatus(L"Canceling task..."); } break;
             case ShowWindowCommand:
@@ -1273,6 +1386,7 @@ private:
             if (reinterpret_cast<NMHDR*>(lparam)->idFrom == RegionList && reinterpret_cast<NMHDR*>(lparam)->code == LVN_ITEMCHANGED) {
                 const auto* item = reinterpret_cast<NMLISTVIEW*>(lparam);
                 if (!suppressChecks_ && (item->uChanged & LVIF_STATE) && ((item->uOldState ^ item->uNewState) & LVIS_STATEIMAGEMASK)) SelectionChanged(true);
+                if ((item->uChanged & LVIF_STATE) && ((item->uOldState ^ item->uNewState) & LVIS_SELECTED)) UpdateProbeButtons();
             }
             if (reinterpret_cast<NMHDR*>(lparam)->idFrom == RegionList && reinterpret_cast<NMHDR*>(lparam)->code == LVN_GETINFOTIP) {
                 auto* tip = reinterpret_cast<NMLVGETINFOTIPW*>(lparam);
