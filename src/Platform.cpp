@@ -615,7 +615,7 @@ std::string DownloadCatalog(std::stop_token stop) {
         CheckStop(stop);
         if (Clock::now() >= deadline) throw std::runtime_error("AWS IP catalog download exceeded 45 second time budget");
     };
-    HttpHandle session(WinHttpOpen(L"RegionLockNative/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    HttpHandle session(WinHttpOpen(L"RegionLockNative/1.0.1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
     if (!session.value) FailWin32("Initialize HTTPS download");
     if (!WinHttpSetTimeouts(session.value, 5000, 8000, 8000, 8000)) FailWin32("Set HTTPS timeouts");

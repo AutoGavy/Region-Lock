@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 cmake_minimum_required(VERSION 3.28)
-project(RegionLockNative VERSION 1.0.0 LANGUAGES C CXX RC)
+project(RegionLockNative VERSION 1.0.1 LANGUAGES C CXX RC)
 
 if(NOT WIN32 OR NOT MSVC)
     message(FATAL_ERROR "RegionLock requires Windows and the Microsoft C/C++ toolchain.")
