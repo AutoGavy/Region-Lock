@@ -179,6 +179,7 @@ public:
                 monitor.rcWork.top + (monitor.rcWork.bottom - monitor.rcWork.top - scaledHeight) / 2,
                 scaledWidth, scaledHeight, SWP_NOZORDER | SWP_NOACTIVATE);
         }
+        if (window_) AddTray();
         return window_ != nullptr;
     }
 
@@ -192,6 +193,7 @@ private:
     HWND title_{}, subtitle_{}, badge_{}, gameLabel_{}, path_{}, browse_{}, detect_{};
     HWND hint_{}, regionsLabel_{}, selectionLabel_{}, list_{}, all_{}, none_{};
     HWND dataLabel_{}, apply_{}, unlock_{}, test_{}, testAll_{}, update_{}, cancel_{}, status_{};
+    RECT pathBox_{};
     Paths paths_;
     Settings settings_;
     Settings appliedSettings_;
@@ -210,6 +212,7 @@ private:
     bool smokeDark_{true}, smokeEnglish_{true}, smokeMaximizedRestore_{};
     bool smokeBusyDark_{}, smokeBusyReadOnly_{}, smokeReadyEditable_{}, smokeSingleInstance_{};
     bool smokeSecondRestored_{};
+    bool smokeTrayAtStartup_{}, smokeTrayRecreatedVisible_{}, smokeTrayRecreatedHidden_{}, smokeTrayRemoved_{};
     bool smokeBackground_{}, smokeEco_{}, smokeResourceRestored_{}, smokeExitNormal_{};
     bool smokeCancellationError_{}, smokeExplicitCancellation_{};
     bool smokeFirewallStatus_{};
@@ -432,7 +435,21 @@ private:
         place(subtitle_, 25, 62, width - 60, 24);
         place(badge_, width - 190, 32, 164, 26);
         place(gameLabel_, 25, 100, 180, 23);
-        place(path_, 24, 127, width - 274, 33);
+        // Keep the native single-line edit only as tall as its font, centered
+        // inside the painted field. Tall native edits top-align their text.
+        pathBox_ = {S(24), S(127), S(width - 250), S(160)};
+        TEXTMETRICW metrics{};
+        HDC pathDc = GetDC(path_);
+        if (pathDc) {
+            const auto oldFont = SelectObject(pathDc, font_);
+            GetTextMetricsW(pathDc, &metrics);
+            SelectObject(pathDc, oldFont);
+            ReleaseDC(path_, pathDc);
+        }
+        const int fieldHeight = pathBox_.bottom - pathBox_.top;
+        const int textHeight = std::min<int>(fieldHeight, (metrics.tmHeight ? metrics.tmHeight : S(18)) + S(2));
+        MoveWindow(path_, pathBox_.left + S(6), pathBox_.top + (fieldHeight - textHeight) / 2,
+            std::max<int>(1, pathBox_.right - pathBox_.left - S(12)), textHeight, TRUE);
         place(browse_, width - 240, 127, 104, 33);
         place(detect_, width - 126, 127, 102, 33);
         place(hint_, 25, 169, width - 50, 24);
@@ -923,6 +940,7 @@ private:
         }
     }
     bool AddTray() {
+        if (trayAdded_) return true;
         NOTIFYICONDATAW data{sizeof(data)};
         data.hWnd = window_; data.uID = kTrayId;
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
@@ -960,7 +978,7 @@ private:
         resources_.SetBackground(false);
         ShowWindow(window_, IsIconic(window_) ? SW_RESTORE : SW_SHOW);
         SetForegroundWindow(window_);
-        DeleteTray();
+        AddTray();
     }
     void UpdateResourceMode() {
         resources_.SetBackground(trayAdded_ && !IsWindowVisible(window_) && !trayMenuOpen_ && !exiting_);
@@ -1056,12 +1074,14 @@ private:
         PAINTSTRUCT paint{}; HDC dc = BeginPaint(window_, &paint);
         RECT client{}; GetClientRect(window_, &client);
         FillRect(dc, &paint.rcPaint, background_);
+        FillRect(dc, &pathBox_, surface_);
         const auto pen = CreatePen(PS_SOLID, 1, kBorder);
         const auto old = SelectObject(dc, pen);
         MoveToEx(dc, S(24), S(199), nullptr); LineTo(dc, client.right - S(24), S(199));
         SelectObject(dc, old); DeleteObject(pen);
         HBRUSH border = CreateSolidBrush(kBorder);
-        for (HWND control : {path_, list_}) {
+        RECT pathBorder = pathBox_; InflateRect(&pathBorder, 1, 1); FrameRect(dc, &pathBorder, border);
+        for (HWND control : {list_}) {
             RECT rect{}; GetWindowRect(control, &rect);
             MapWindowPoints(HWND_DESKTOP, window_, reinterpret_cast<POINT*>(&rect), 2);
             InflateRect(&rect, 1, 1); FrameRect(dc, &rect, border);
@@ -1142,6 +1162,12 @@ private:
     void SmokeStep() {
         if constexpr (kSmokeBuild) {
             if (smokeStage_ == 0) {
+                smokeTrayAtStartup_ = trayAdded_ && IsWindowVisible(window_);
+                // Simulate Explorer losing this test icon without restarting
+                // Explorer or touching another application's notification icon.
+                DeleteTray();
+                if (taskbarCreated_) SendMessageW(window_, taskbarCreated_, 0, 0);
+                smokeTrayRecreatedVisible_ = trayAdded_ && IsWindowVisible(window_);
                 const auto containsHan = [](std::wstring_view text) {
                     return std::any_of(text.begin(), text.end(), [](wchar_t c) { return c >= 0x3400 && c <= 0x9fff; });
                 };
@@ -1201,6 +1227,9 @@ private:
                 smokeVisibleCpu_ = CpuTime() - smokeCpuBaseline_;
                 SendMessageW(window_, WM_SYSCOMMAND, SC_MINIMIZE, 0);
                 smokeMinimized_ = !IsWindowVisible(window_) && trayAdded_;
+                DeleteTray();
+                if (taskbarCreated_) SendMessageW(window_, taskbarCreated_, 0, 0);
+                smokeTrayRecreatedHidden_ = trayAdded_ && !IsWindowVisible(window_);
                 smokeTrayPriority_ = GetPriorityClass(GetCurrentProcess());
                 smokeTrayThreadPriority_ = ThreadBasePriority();
                 smokeBackground_ = resources_.Background() && resources_.Idle() && resources_.BackgroundError() == ERROR_SUCCESS
@@ -1230,7 +1259,7 @@ private:
                     smokePrivateBytes_ = memory.PrivateUsage;
                 }
                 ShowMain();
-                smokeRestored_ = IsWindowVisible(window_) && !trayAdded_;
+                smokeRestored_ = IsWindowVisible(window_) && trayAdded_;
                 PROCESS_POWER_THROTTLING_STATE power{PROCESS_POWER_THROTTLING_CURRENT_VERSION};
                 MEMORY_PRIORITY_INFORMATION memoryPriority{};
                 smokeResourceRestored_ = !resources_.Background() && !resources_.Idle() && !resources_.Eco()
@@ -1242,7 +1271,7 @@ private:
                 ShowWindow(window_, SW_MAXIMIZE);
                 SendMessageW(window_, WM_SYSCOMMAND, SC_MINIMIZE, 0);
                 ShowMain();
-                smokeMaximizedRestore_ = IsWindowVisible(window_) && IsZoomed(window_) && !trayAdded_;
+                smokeMaximizedRestore_ = IsWindowVisible(window_) && IsZoomed(window_) && trayAdded_;
                 HideToTray();
                 if (StartSmokeSecondInstance()) {
                     smokeStage_ = 5;
@@ -1264,12 +1293,13 @@ private:
                     return TRUE;
                 }, reinterpret_cast<LPARAM>(&windows));
                 smokeSingleInstance_ = wait == WAIT_OBJECT_0 && GetExitCodeProcess(smokeSecondProcess_, &exitCode)
-                    && exitCode == 0 && windows == 1 && smokeSecondRestored_ && IsWindowVisible(window_) && !trayAdded_;
+                    && exitCode == 0 && windows == 1 && smokeSecondRestored_ && IsWindowVisible(window_) && trayAdded_;
                 smokePassed_ = loaded_ && smokeScreenshot_ && smokeMinimized_ && smokeRestored_
                     && smokeDark_ && smokeEnglish_ && smokeMaximizedRestore_
                     && smokeBusyDark_ && smokeBusyReadOnly_ && smokeReadyEditable_ && smokeSingleInstance_
                     && smokeBackground_ && smokeEco_ && smokeResourceRestored_
                     && smokeFirewallStatus_
+                    && smokeTrayAtStartup_ && smokeTrayRecreatedVisible_ && smokeTrayRecreatedHidden_
                     && smokeVisibleCpu_ <= 1000000 && smokeHiddenCpu_ <= 1000000;
                 smokeStage_ = 6;
                 RunJob(Job::Update, [](Result&, std::stop_token stop) {
@@ -1291,6 +1321,10 @@ private:
             << ",\n  \"catalog_regions\": " << catalog_.regions.size()
             << ",\n  \"minimized_to_tray\": " << (smokeMinimized_ ? "true" : "false")
             << ",\n  \"restored_from_tray\": " << (smokeRestored_ ? "true" : "false")
+            << ",\n  \"tray_present_at_startup\": " << (smokeTrayAtStartup_ ? "true" : "false")
+            << ",\n  \"tray_recreated_while_visible\": " << (smokeTrayRecreatedVisible_ ? "true" : "false")
+            << ",\n  \"tray_recreated_while_hidden\": " << (smokeTrayRecreatedHidden_ ? "true" : "false")
+            << ",\n  \"tray_removed_on_exit\": " << (smokeTrayRemoved_ ? "true" : "false")
             << ",\n  \"close_exited\": " << (smokeClosed_ ? "true" : "false")
             << ",\n  \"screenshot_saved\": " << (smokeScreenshot_ ? "true" : "false")
             << ",\n  \"english_ui\": " << (smokeEnglish_ ? "true" : "false")
@@ -1334,7 +1368,9 @@ private:
     }
     LRESULT Handle(UINT message, WPARAM wparam, LPARAM lparam) {
         if (taskbarCreated_ && message == taskbarCreated_) {
-            if (trayAdded_) { trayAdded_ = false; if (!AddTray()) ShowMain(); }
+            trayAdded_ = false;
+            if (!AddTray()) ShowMain();
+            UpdateResourceMode();
             return 0;
         }
         switch (message) {
@@ -1410,6 +1446,10 @@ private:
             SetTextColor(dc, color); return reinterpret_cast<LRESULT>(background_);
         }
         case WM_ERASEBKGND: return 1;
+        case WM_LBUTTONDOWN:
+            { POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+              if (PtInRect(&pathBox_, point)) { SetFocus(path_); return 0; } }
+            break;
         case WM_PAINT: Paint(); return 0;
         case kJobDone: FinishJob(std::unique_ptr<Result>(reinterpret_cast<Result*>(lparam))); return 0;
         case kProbeDone: ShowProbe(std::unique_ptr<ProbeResult>(reinterpret_cast<ProbeResult*>(lparam))); return 0;
@@ -1436,7 +1476,9 @@ private:
             return 0;
         case WM_CLOSE: RequestExit(); return 0;
         case WM_DESTROY:
-            DeleteTray(); SaveSmokeReport(); PostQuitMessage(smokePassed_ ? 0 : 1); return 0;
+            DeleteTray();
+            if constexpr (kSmokeBuild) { smokeTrayRemoved_ = !trayAdded_; smokePassed_ = smokePassed_ && smokeTrayRemoved_; }
+            SaveSmokeReport(); PostQuitMessage(smokePassed_ ? 0 : 1); return 0;
         }
         return DefWindowProcW(window_, message, wparam, lparam);
     }

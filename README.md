@@ -12,7 +12,7 @@ Native Windows region selection for Battlefield 6. English interface, dark theme
 
 Click a region row, then **Test region** to test it, or choose **Test all**.
 
-Minimize to keep the lock active in the tray with low resource priority. Close to **unlock regions and exit**.
+The tray icon stays available while running. Minimize to keep the lock active with low resource priority. Close to **unlock regions and exit**.
 
 **Update data** refreshes the official AWS IP ranges. Rules affect only the selected game. AWS ranges are not an official Battlefield server list; matchmaking results are not guaranteed.
 
