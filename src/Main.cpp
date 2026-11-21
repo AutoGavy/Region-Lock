@@ -217,6 +217,7 @@ private:
     bool smokeCancellationError_{}, smokeExplicitCancellation_{};
     bool smokeFirewallStatus_{};
     bool smokeSingleProbe_{}, smokeAllProbes_{}, smokeCanceledProbe_{}, smokeNoProbeTarget_{}, smokeHoldProbes_{};
+    bool smokeModifierSelection_{}, smokeBatchProbe_{}, smokeBatchCanceled_{};
     std::vector<std::string> smokeAllowedBeforeProbe_;
     DWORD smokeOriginalPriority_{}, smokeTrayPriority_{};
     ULONG smokeTrayMemoryPriority_{};
@@ -271,7 +272,7 @@ private:
         // Only allow the pointer-free taskbar recreation notification through UIPI.
         if (taskbarCreated_) ChangeWindowMessageFilterEx(window_, taskbarCreated_, MSGFLT_ALLOW, nullptr);
         title_ = Control(L"STATIC", L"Region Lock", SS_LEFT);
-        subtitle_ = Control(L"STATIC", L"Choose where Battlefield 6 can match. Select a row to test one region.", SS_LEFT);
+        subtitle_ = Control(L"STATIC", L"Choose where Battlefield 6 can match. Ctrl/Shift-click rows to test selected regions.", SS_LEFT);
         badge_ = Control(L"STATIC", L"Loading...", SS_RIGHT);
         gameLabel_ = Control(L"STATIC", L"Game executable", SS_LEFT);
         path_ = Control(L"EDIT", L"", ES_AUTOHSCROLL | ES_READONLY | WS_TABSTOP, GamePath);
@@ -282,7 +283,7 @@ private:
         selectionLabel_ = Control(L"STATIC", L"", SS_RIGHT);
         all_ = Control(L"BUTTON", L"All", BS_OWNERDRAW | WS_TABSTOP, SelectAll);
         none_ = Control(L"BUTTON", L"None", BS_OWNERDRAW | WS_TABSTOP, SelectNone);
-        list_ = Control(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS | WS_TABSTOP,
+        list_ = Control(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS | WS_TABSTOP,
             RegionList);
         ListView_SetExtendedListViewStyle(list_, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP);
         ListView_SetBkColor(list_, kSurface);
@@ -311,7 +312,7 @@ private:
         dataLabel_ = Control(L"STATIC", L"Loading region data...", SS_LEFT);
         apply_ = Control(L"BUTTON", L"Apply lock", BS_OWNERDRAW | WS_TABSTOP, Apply);
         unlock_ = Control(L"BUTTON", L"Unlock", BS_OWNERDRAW | WS_TABSTOP, Unlock);
-        test_ = Control(L"BUTTON", L"Test region", BS_OWNERDRAW | WS_TABSTOP, Test);
+        test_ = Control(L"BUTTON", L"Test selected", BS_OWNERDRAW | WS_TABSTOP, Test);
         testAll_ = Control(L"BUTTON", L"Test all", BS_OWNERDRAW | WS_TABSTOP, TestAll);
         update_ = Control(L"BUTTON", L"Update data", BS_OWNERDRAW | WS_TABSTOP, Update);
         cancel_ = Control(L"BUTTON", L"Cancel", BS_OWNERDRAW | WS_TABSTOP, Cancel);
@@ -715,18 +716,23 @@ private:
             RefreshFirewall(result, count);
         });
     }
+    std::vector<int> SelectedProbeRows() const {
+        std::vector<int> rows;
+        for (int row = -1; (row = ListView_GetNextItem(list_, row, LVNI_SELECTED)) >= 0;)
+            if (static_cast<std::size_t>(row) < catalog_.regions.size()) rows.push_back(row);
+        return rows;
+    }
     void BeginProbe(bool allRegions) {
         if (busy_ || !loaded_) return;
         std::vector<int> rows;
         if (allRegions) {
             for (int i = 0; i < ListView_GetItemCount(list_); ++i) rows.push_back(i);
         } else {
-            const int row = ListView_GetNextItem(list_, -1, LVNI_SELECTED);
-            if (row < 0 || static_cast<std::size_t>(row) >= catalog_.regions.size()) {
-                SetStatus(L"Select a region row, then choose Test region.");
+            rows = SelectedProbeRows();
+            if (rows.empty()) {
+                SetStatus(L"Select one or more region rows, then choose Test selected.");
                 return;
             }
-            rows.push_back(row);
         }
         std::vector<std::string> codes;
         codes.reserve(rows.size());
@@ -739,7 +745,8 @@ private:
         probeRows_ = std::move(rows);
         probeCompleted_ = 0;
         SetStatus(allRegions ? L"Testing all regions, up to 4 at once, with 5 UDP requests per region..."
-            : L"Testing " + catalog_.regions[static_cast<std::size_t>(probeRows_.front())].name + L", with 5 UDP requests...");
+            : probeRows_.size() == 1 ? L"Testing " + catalog_.regions[static_cast<std::size_t>(probeRows_.front())].name + L", with 5 UDP requests..."
+            : L"Testing " + Number(probeRows_.size()) + L" selected regions, up to 4 at once, with 5 UDP requests per region...");
         try { RunJob(Job::Probe, [this, codes = std::move(codes)](Result& result, std::stop_token stop) {
             std::atomic<std::size_t> next{};
             std::vector<std::jthread> workers;
@@ -867,6 +874,7 @@ private:
                 for (int row = 0; row < ListView_GetItemCount(list_); ++row)
                     smokeAllProbes_ = smokeAllProbes_ && ProbeCell(row, 4) == L"42 ms" && ProbeCell(row, 5) == L"100% (5/5)";
                 smokeStage_ = 10;
+                ListView_SetItemState(list_, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
                 ListView_SetItemState(list_, 2, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
                 smokeHoldProbes_ = true;
                 SendMessageW(window_, WM_COMMAND, Test, 0);
@@ -880,6 +888,32 @@ private:
                     && ProbeCell(2, 4) == L"Canceled" && ProbeCell(1, 4) == L"42 ms"
                     && IsWindowEnabled(test_) && IsWindowEnabled(testAll_) && Selection() == smokeAllowedBeforeProbe_;
                 smokePassed_ = smokePassed_ && smokeNoProbeTarget_ && smokeSingleProbe_ && smokeAllProbes_ && smokeCanceledProbe_;
+                StartBatchProbeSmoke();
+                return;
+            }
+            if (kind == Job::Probe && smokeStage_ == 11) {
+                smokeBatchProbe_ = smokeBatchProbe_ && result->success && !result->canceled && probeCompleted_ == 4
+                    && probeRows_ == std::vector<int>({1, 2, 3, 5}) && Selection() == smokeAllowedBeforeProbe_;
+                for (int row = 0; row < ListView_GetItemCount(list_); ++row) {
+                    const bool tested = row == 1 || row == 2 || row == 3 || row == 5;
+                    smokeBatchProbe_ = smokeBatchProbe_ && ProbeCell(row, 4) == (tested ? L"42 ms" : L"Old latency")
+                        && ProbeCell(row, 5) == (tested ? L"100% (5/5)" : L"Old replies");
+                    if (!tested) smokeBatchProbe_ = smokeBatchProbe_ && probeDetails_[static_cast<std::size_t>(row)] == L"Previous result";
+                }
+                ListView_SetItemState(list_, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+                for (int row : {0, 2}) ListView_SetItemState(list_, row, LVIS_SELECTED, LVIS_SELECTED);
+                smokeStage_ = 12; smokeHoldProbes_ = true;
+                SendMessageW(window_, WM_COMMAND, Test, 0);
+                smokeBatchCanceled_ = busy_ && probeRows_ == std::vector<int>({0, 2});
+                SendMessageW(window_, WM_COMMAND, Cancel, 0);
+                return;
+            }
+            if (kind == Job::Probe && smokeStage_ == 12) {
+                smokeHoldProbes_ = false;
+                smokeBatchCanceled_ = smokeBatchCanceled_ && result->canceled && probeCompleted_ == 0
+                    && ProbeCell(0, 4) == L"Canceled" && ProbeCell(2, 4) == L"Canceled"
+                    && ProbeCell(1, 4) == L"42 ms" && Selection() == smokeAllowedBeforeProbe_;
+                smokePassed_ = smokePassed_ && smokeModifierSelection_ && smokeBatchProbe_ && smokeBatchCanceled_;
                 CaptureWindow();
                 // Exit from a hidden window must leave background mode before cleanup.
                 HideToTray(); RequestExit();
@@ -1102,9 +1136,14 @@ private:
         const COLORREF background = GetPixel(memory, sample.x - rect.left, sample.y - rect.top);
         smokeDark_ = smokeDark_ && background != CLR_INVALID && GetRValue(background) < 40
             && GetGValue(background) < 40 && GetBValue(background) < 40;
-        if (ListView_GetItemCount(list_) > 0) {
-            RECT row{};
-            ListView_GetItemRect(list_, 0, &row, LVIR_BOUNDS);
+        int sampleRow = ListView_GetTopIndex(list_);
+        while (sampleRow < ListView_GetItemCount(list_) && (ListView_GetItemState(list_, sampleRow, LVIS_SELECTED) & LVIS_SELECTED)) ++sampleRow;
+        RECT listClient{}; GetClientRect(list_, &listClient);
+        RECT row{};
+        // Selected rows use the theme's highlight color; sample an ordinary
+        // visible row when checking that the list background stays dark.
+        if (sampleRow < ListView_GetItemCount(list_) && ListView_GetItemRect(list_, sampleRow, &row, LVIR_BOUNDS)
+            && row.bottom <= listClient.bottom) {
             POINT cell{ListView_GetColumnWidth(list_, 0) - S(12), (row.top + row.bottom) / 2};
             ClientToScreen(list_, &cell);
             const COLORREF listBackground = GetPixel(memory, cell.x - rect.left, cell.y - rect.top);
@@ -1139,6 +1178,44 @@ private:
         smokeSecondProcess_ = process.hProcess;
         smokeSecondStarted_ = GetTickCount64();
         return true;
+    }
+    void SmokeClickRegion(int row, UINT modifiers) {
+        if constexpr (kSmokeBuild) {
+            BYTE original[256]{};
+            if (!GetKeyboardState(original)) return;
+            BYTE keys[256]{}; std::copy(std::begin(original), std::end(original), std::begin(keys));
+            for (int key : {VK_CONTROL, VK_LCONTROL, VK_RCONTROL}) keys[key] = (modifiers & MK_CONTROL) ? 0x80 : 0;
+            for (int key : {VK_SHIFT, VK_LSHIFT, VK_RSHIFT}) keys[key] = (modifiers & MK_SHIFT) ? 0x80 : 0;
+            if (!SetKeyboardState(keys)) return;
+            RECT label{}; ListView_GetItemRect(list_, row, &label, LVIR_LABEL);
+            const LPARAM position = MAKELPARAM(label.left + S(10), (label.top + label.bottom) / 2);
+            SendMessageW(list_, WM_LBUTTONDOWN, MK_LBUTTON | modifiers, position);
+            SendMessageW(list_, WM_LBUTTONUP, modifiers, position);
+            SetKeyboardState(original);
+        }
+    }
+    void StartBatchProbeSmoke() {
+        if constexpr (kSmokeBuild) {
+            for (int row = 0; row < ListView_GetItemCount(list_); ++row) {
+                ListView_SetItemText(list_, row, 4, const_cast<wchar_t*>(L"Old latency"));
+                ListView_SetItemText(list_, row, 5, const_cast<wchar_t*>(L"Old replies"));
+                probeDetails_[static_cast<std::size_t>(row)] = L"Previous result";
+            }
+            ListView_SetItemState(list_, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+            SetFocus(list_);
+            SmokeClickRegion(1, 0);
+            SmokeClickRegion(3, MK_SHIFT);
+            smokeModifierSelection_ = SelectedProbeRows() == std::vector<int>({1, 2, 3});
+            SmokeClickRegion(5, MK_CONTROL);
+            smokeModifierSelection_ = smokeModifierSelection_ && SelectedProbeRows() == std::vector<int>({1, 2, 3, 5})
+                && Selection() == smokeAllowedBeforeProbe_;
+            smokeStage_ = 11;
+            SendMessageW(window_, WM_COMMAND, Test, 0);
+            smokeBatchProbe_ = busy_ && probeRows_ == std::vector<int>({1, 2, 3, 5});
+            // Changing the highlight after starting must not change the batch.
+            ListView_SetItemState(list_, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_SetItemState(list_, 7, LVIS_SELECTED, LVIS_SELECTED);
+        }
     }
     void StartProbeSmoke() {
         if constexpr (kSmokeBuild) {
@@ -1355,6 +1432,9 @@ private:
             << ",\n  \"all_regions_probe\": " << (smokeAllProbes_ ? "true" : "false")
             << ",\n  \"single_region_probe_cancellation\": " << (smokeCanceledProbe_ ? "true" : "false")
             << ",\n  \"probe_requires_selected_row\": " << (smokeNoProbeTarget_ ? "true" : "false")
+            << ",\n  \"ctrl_shift_region_selection\": " << (smokeModifierSelection_ ? "true" : "false")
+            << ",\n  \"selected_regions_batch_probe\": " << (smokeBatchProbe_ ? "true" : "false")
+            << ",\n  \"selected_regions_batch_cancellation\": " << (smokeBatchCanceled_ ? "true" : "false")
             << ",\n  \"visible_idle_cpu_ms_over_2500ms\": " << static_cast<double>(smokeVisibleCpu_) / 10000.0
             << ",\n  \"tray_idle_cpu_ms_over_2500ms\": " << static_cast<double>(smokeHiddenCpu_) / 10000.0
             << ",\n  \"working_set_bytes\": " << smokeWorkingSet_

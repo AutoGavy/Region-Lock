@@ -10,7 +10,7 @@ Native Windows region selection for Battlefield 6. English interface, dark theme
 2. Run the EXE, select `bf6.exe`, check allowed regions, and click **Apply lock**.
 3. Restart the game after changing regions.
 
-Click a region row, then **Test region** to test it, or choose **Test all**.
+Ctrl-click multiple rows or Shift-click a range, then **Test selected**; use **Test all** for every region.
 
 The tray icon stays available while running. Minimize to keep the lock active with low resource priority. Close to **unlock regions and exit**.
 
